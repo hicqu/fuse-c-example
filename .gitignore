@@ -1,3 +1,5 @@
 mountpoint
 realdir
 fs
+libmap.a
+main.o
