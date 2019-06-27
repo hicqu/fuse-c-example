@@ -2,7 +2,7 @@ use std::boxed::Box;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::ptr;
+use std::{mem, ptr};
 
 type Map = HashMap<CString, *mut u8>;
 
@@ -42,13 +42,21 @@ pub extern "C" fn hash_map_remove(map: *mut Map, key: *const c_char) -> *mut u8 
 
 // TODO: pass in a callback to deconstruct values.
 #[no_mangle]
-pub extern "C" fn free_map(map: *mut Map, free_value: fn(*mut u8)) {
-    let map = unsafe { Box::from_raw(map) };
-    for (_, value) in map.into_iter() {
+pub extern "C" fn clear_map(map: *mut Map, free_value: fn(*mut u8)) {
+    let mut map = unsafe { Box::from_raw(map) };
+    let taked_map = mem::replace(map.as_mut(), HashMap::new());
+    Box::into_raw(map);
+    for (_, value) in taked_map {
         if !(free_value as *const ()).is_null() {
             free_value(value);
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn destroy_map(map: *mut Map) {
+    let map = unsafe { Box::from_raw(map) };
+    assert!(map.is_empty());
 }
 
 #[repr(C)]

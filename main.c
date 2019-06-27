@@ -16,8 +16,9 @@ static const char *realdir = "./realdir";
 // A map from path to its undo_logs.
 struct CMap;
 extern struct CMap *init_hash_map();
+extern void clear_map(struct CMap *map, void (*free_value)(void *));
+extern void destroy_map(struct CMap *map);
 extern void *hash_map_get(struct CMap *map, const char *key);
-extern void free_map(struct CMap *map, void (*)(void *));
 extern void *hash_map_insert(struct CMap *map, const char *key, void *value);
 extern void *hash_map_remove(struct CMap *map, const char *key);
 
@@ -52,6 +53,9 @@ void free_undo_log(struct undo_log_entry *undo_log) {
         free(undo_log->ptr);
     }
     undo_logs_size -= undo_log->size;
+    undo_log->next = NULL;
+    undo_log->global_next = NULL;
+    undo_log->global_prev = NULL;
     free(undo_log);
 }
 
@@ -86,7 +90,9 @@ void free_all_undo_logs() {
         free_undo_log(entry);
         entry = next;
     }
-    free_map(path_to_undo_logs, free);
+    undo_logs_head = NULL;
+    undo_logs_tail = NULL;
+    clear_map(path_to_undo_logs, NULL);
 }
 
 // get attributes from tmp file first, try real path if the tmp file doesn't exist.
