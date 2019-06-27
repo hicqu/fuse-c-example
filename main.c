@@ -17,7 +17,7 @@ static const char *realdir = "./realdir";
 struct CMap;
 extern struct CMap *init_hash_map();
 extern void *hash_map_get(struct CMap *map, const char *key);
-extern void free_map(struct CMap *map, void (*)(void *), void (*)(void *));
+extern void free_map(struct CMap *map, void (*)(void *));
 extern void *hash_map_insert(struct CMap *map, const char *key, void *value);
 extern void *hash_map_remove(struct CMap *map, const char *key);
 
@@ -42,8 +42,8 @@ static struct undo_log_entry *undo_logs_tail = NULL;
 static struct CMap *path_to_undo_logs = NULL;
 static pthread_mutex_t undo_logs_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static const size_t LARGE_UNDO_LOG_SISE = (1 << 20) * 32; // 32M 
-static const int UNDO_LOG_FLUSH_INTERVAL = 30;             // 30s
+static const size_t LARGE_UNDO_LOG_SISE = (1 << 20) * 32; // 32M
+static const int UNDO_LOG_FLUSH_INTERVAL = 30;            // 30s
 static size_t undo_logs_size = 0;
 
 // Must be called in lock context.
@@ -75,6 +75,7 @@ void free_undo_logs_for_fsync(const char *path) {
         free_undo_log(entry);
         entry = next;
     }
+    hash_map_remove(path_to_undo_logs, path);
 }
 
 // Must be called in lock context.
@@ -85,7 +86,7 @@ void free_all_undo_logs() {
         free_undo_log(entry);
         entry = next;
     }
-    free_map(path_to_undo_logs, free, NULL);
+    free_map(path_to_undo_logs, free);
 }
 
 // get attributes from tmp file first, try real path if the tmp file doesn't exist.
@@ -152,7 +153,7 @@ static int readdir_callback(const char *path, void *buf, fuse_fill_dir_t filler,
 }
 
 static int open_callback(const char *path, struct fuse_file_info *fi) {
-    fprintf(stderr, "open %s, flags: %o, fi ptr: %lx\n", path, fi->flags, (long)fi);
+    fprintf(stderr, "open %s, flags: %o, fd: %ld\n", path, fi->flags, fi->fh);
     char *real_path = zero_malloc(1 + strlen(realdir) + strlen(path));
     sprintf(real_path, "%s%s", realdir, path);
     fi->fh = open(real_path, fi->flags);
@@ -162,8 +163,7 @@ static int open_callback(const char *path, struct fuse_file_info *fi) {
 
 static int read_callback(const char *path, char *buf, size_t size, off_t offset,
                          struct fuse_file_info *fi) {
-    fprintf(stderr, "read %s from %ld, want %ld bytes, fi ptr: %lx\n", path, offset, size,
-            (long)fi);
+    fprintf(stderr, "read %s from %ld, want %ld bytes, fd: %ld\n", path, offset, size, fi->fh);
     ssize_t readed = pread(fi->fh, buf, size, offset);
     if (readed < 0) {
         return -errno;
@@ -286,7 +286,7 @@ static int create_callback(const char *path, mode_t mode, struct fuse_file_info 
     char *real_path = zero_malloc(1 + strlen(realdir) + strlen(path));
     sprintf(real_path, "%s%s", realdir, path);
 
-    fi->flags = O_CREAT;
+    fi->flags |= O_CREAT;
     fi->fh = open(real_path, fi->flags, mode);
     free(real_path);
     if (fi->fh < 0) {
@@ -378,8 +378,7 @@ static int symlink_callback(const char *path, const char *link_path) {
 
 static int write_callback(const char *path, const char *buf, size_t size, off_t offset,
                           struct fuse_file_info *fi) {
-    fprintf(stderr, "write %s from %ld, want %ld bytes, fi ptr: %lx\n", path, offset, size,
-            (long)fi);
+    fprintf(stderr, "write %s from %ld, want %ld bytes, fh: %ld\n", path, offset, size, fi->fh);
     assert(!fi->flush);
 
     // Allocate an undo log, and set its offset and path.
@@ -420,6 +419,7 @@ static int write_callback(const char *path, const char *buf, size_t size, off_t 
 
     ssize_t writed = pwrite(fi->fh, buf, size, offset);
     if (writed < 0) {
+        fprintf(stderr, "write to %ld fail: %s\n", fi->fh, strerror(errno));
         return -errno;
     }
     return writed;
@@ -471,6 +471,19 @@ static int setxattr_callback(const char *path, const char *name, const char *val
     return 0;
 }
 
+static int statfs_callback(const char *path, struct statvfs *vfsbuf) {
+    fprintf(stderr, "statfs %s\n", path);
+    char *real_path = zero_malloc(1 + strlen(realdir) + strlen(path));
+    sprintf(real_path, "%s%s", realdir, path);
+
+    int error = statvfs(real_path, vfsbuf);
+    free(real_path);
+    if (error) {
+        return -errno;
+    }
+    return 0;
+}
+
 static struct fuse_operations fuse_example_operations = {
     .getattr = getattr_callback,
     .opendir = opendir_callback,
@@ -496,6 +509,7 @@ static struct fuse_operations fuse_example_operations = {
     .fsync = fsync_callback,
     .getxattr = getxattr_callback,
     .setxattr = setxattr_callback,
+    .statfs = statfs_callback,
 };
 
 void *fs_event_loop(void *arg) {
@@ -509,12 +523,16 @@ void *flush_loop(void *arg) {
     while (1) {
         sleep(1);
         time_t now = time(NULL);
-        if (now - start < UNDO_LOG_FLUSH_INTERVAL) {
-            continue;
+        if (now - start >= UNDO_LOG_FLUSH_INTERVAL) {
+            goto FLUSH;
         }
-        if (__sync_fetch_and_add(&undo_logs_size, 0) < LARGE_UNDO_LOG_SISE) {
-            continue;
+        size_t dirty_bytes = __sync_fetch_and_add(&undo_logs_size, 0);
+        if (dirty_bytes >= LARGE_UNDO_LOG_SISE) {
+            goto FLUSH;
         }
+        continue;
+    FLUSH:
+        fprintf(stderr, "flush all dirty pages, total bytes: %ld\n", dirty_bytes);
         start = now;
         pthread_mutex_lock(&undo_logs_mutex);
         free_all_undo_logs();
@@ -523,6 +541,8 @@ void *flush_loop(void *arg) {
 }
 
 int main(int argc, char *argv[]) {
+    path_to_undo_logs = init_hash_map();
+
     char *mountpoint;
     int multithreaded;
     struct fuse *fs = fuse_setup(argc, argv, &fuse_example_operations,

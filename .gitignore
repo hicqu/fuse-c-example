@@ -1,5 +1,6 @@
 mountpoint
 realdir
 fs
+fs-debug
 libmap.a
 main.o
