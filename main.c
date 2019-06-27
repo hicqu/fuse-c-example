@@ -529,10 +529,10 @@ void *flush_loop(void *arg) {
     while (1) {
         sleep(1);
         time_t now = time(NULL);
+        size_t dirty_bytes = __sync_fetch_and_add(&undo_logs_size, 0);
         if (now - start >= UNDO_LOG_FLUSH_INTERVAL) {
             goto FLUSH;
         }
-        size_t dirty_bytes = __sync_fetch_and_add(&undo_logs_size, 0);
         if (dirty_bytes >= LARGE_UNDO_LOG_SISE) {
             goto FLUSH;
         }
