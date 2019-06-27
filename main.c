@@ -44,7 +44,7 @@ static struct CMap *path_to_undo_logs = NULL;
 static pthread_mutex_t undo_logs_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static const size_t LARGE_UNDO_LOG_SISE = (1 << 20) * 32; // 32M
-static const int UNDO_LOG_FLUSH_INTERVAL = 30;            // 30s
+static const int UNDO_LOG_FLUSH_INTERVAL = 5;             // 30s
 static size_t undo_logs_size = 0;
 
 // Must be called in lock context.
