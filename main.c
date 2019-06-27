@@ -40,14 +40,22 @@ struct undo_log_entry {
 static struct undo_log_entry *undo_logs_head = NULL;
 static struct undo_log_entry *undo_logs_tail = NULL;
 static struct CMap *path_to_undo_logs = NULL;
+static pthread_mutex_t undo_logs_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static const size_t LARGE_UNDO_LOG_SISE = (1 << 20) * 32; // 32M 
+static const int UNDO_LOG_FLUSH_INTERVAL = 30;             // 30s
+static size_t undo_logs_size = 0;
+
+// Must be called in lock context.
 void free_undo_log(struct undo_log_entry *undo_log) {
     if (undo_log->ptr) {
         free(undo_log->ptr);
     }
+    undo_logs_size -= undo_log->size;
     free(undo_log);
 }
 
+// Must be called in lock context.
 void free_undo_logs_for_fsync(const char *path) {
     struct undo_log_entry *entry = hash_map_get(path_to_undo_logs, path);
     while (entry) {
@@ -69,6 +77,7 @@ void free_undo_logs_for_fsync(const char *path) {
     }
 }
 
+// Must be called in lock context.
 void free_all_undo_logs() {
     struct undo_log_entry *entry = undo_logs_head;
     while (entry) {
@@ -231,7 +240,6 @@ static int rmdir_callback(const char *path) {
 static int do_rename(const char *path1, const char *path2) {
     char *real_path1 = zero_malloc(1 + strlen(path1) + strlen(realdir));
     sprintf(real_path1, "%s%s", realdir, path1);
-
     char *real_path2 = zero_malloc(1 + strlen(path2) + strlen(realdir));
     sprintf(real_path2, "%s%s", realdir, path2);
 
@@ -251,11 +259,12 @@ static int rename_callback(const char *path1, const char *path2) {
         return error;
     }
 
-    extern void *hash_map_insert(struct CMap * map, const char *key, void *value);
-    extern void *hash_map_remove(struct CMap * map, const char *key);
+    pthread_mutex_lock(&undo_logs_mutex);
     void *undo_log = hash_map_remove(path_to_undo_logs, path1);
-    assert(undo_log);
-    hash_map_insert(path_to_undo_logs, path2, undo_log);
+    if (undo_log) {
+        hash_map_insert(path_to_undo_logs, path2, undo_log);
+    }
+    pthread_mutex_unlock(&undo_logs_mutex);
     return 0;
 }
 
@@ -393,6 +402,7 @@ static int write_callback(const char *path, const char *buf, size_t size, off_t 
         undo_log->size = backup_size;
     }
 
+    pthread_mutex_lock(&undo_logs_mutex);
     // Link the undo log to the global buffer.
     if (!undo_logs_tail) {
         undo_logs_tail = undo_log;
@@ -402,9 +412,11 @@ static int write_callback(const char *path, const char *buf, size_t size, off_t 
         undo_logs_tail->global_next = undo_log;
         undo_logs_tail = undo_log;
     }
-
+    // Link the undo log to the file's buffer.
     undo_log->next = hash_map_get(path_to_undo_logs, path);
     hash_map_insert(path_to_undo_logs, path, undo_log);
+    undo_logs_size += undo_log->size;
+    pthread_mutex_unlock(&undo_logs_mutex);
 
     ssize_t writed = pwrite(fi->fh, buf, size, offset);
     if (writed < 0) {
@@ -426,7 +438,9 @@ static int release_callback(const char *path, struct fuse_file_info *fi) {
 static int fsync_callback(const char *path, int datasync /* only sync user data */,
                           struct fuse_file_info *fi) {
     fprintf(stderr, "fsync %s, only care about data: %d\n", path, datasync);
+    pthread_mutex_lock(&undo_logs_mutex);
     free_undo_logs_for_fsync(path);
+    pthread_mutex_unlock(&undo_logs_mutex);
     return 0;
 }
 
@@ -490,15 +504,34 @@ void *fs_event_loop(void *arg) {
     return NULL;
 }
 
+void *flush_loop(void *arg) {
+    time_t start = time(NULL);
+    while (1) {
+        sleep(1);
+        time_t now = time(NULL);
+        if (now - start < UNDO_LOG_FLUSH_INTERVAL) {
+            continue;
+        }
+        if (__sync_fetch_and_add(&undo_logs_size, 0) < LARGE_UNDO_LOG_SISE) {
+            continue;
+        }
+        start = now;
+        pthread_mutex_lock(&undo_logs_mutex);
+        free_all_undo_logs();
+        pthread_mutex_unlock(&undo_logs_mutex);
+    }
+}
+
 int main(int argc, char *argv[]) {
     char *mountpoint;
     int multithreaded;
     struct fuse *fs = fuse_setup(argc, argv, &fuse_example_operations,
                                  sizeof(struct fuse_operations), &mountpoint, &multithreaded, NULL);
-    pthread_t th;
-    pthread_create(&th, NULL, fs_event_loop, fs);
+    pthread_t fs_thread, flush_thread;
+    pthread_create(&fs_thread, NULL, fs_event_loop, fs);
+    pthread_create(&flush_thread, NULL, flush_loop, NULL);
+
     sleep(30000000);
     fuse_teardown(fs, mountpoint);
     return 0;
-    // return fuse_main(argc, argv, &fuse_example_operations, NULL);
 }
