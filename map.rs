@@ -2,7 +2,7 @@ use std::boxed::Box;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::{mem, ptr};
+use std::{alloc, mem, ptr};
 
 type Map = HashMap<CString, *mut u8>;
 
@@ -51,6 +51,24 @@ pub extern "C" fn clear_map(map: *mut Map, free_value: fn(*mut u8)) {
             free_value(value);
         }
     }
+}
+
+#[no_mangle]
+pub extern "C" fn map_next_key(map: *mut Map) -> *mut c_char {
+    let map = unsafe { Box::from_raw(map) };
+    if let Some(key) = map.keys().next() {
+        let s = key.as_bytes_with_nul();
+        let ptr = unsafe {
+            let layout = alloc::Layout::from_size_align(s.len(), 1).unwrap();
+            let p = alloc::alloc(layout);
+            ptr::copy_nonoverlapping(&s[0], p, s.len());
+            p
+        };
+        Box::into_raw(map);
+        return ptr as *mut c_char;
+    }
+    Box::into_raw(map);
+    ptr::null_mut()
 }
 
 #[no_mangle]

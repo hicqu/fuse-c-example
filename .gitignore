@@ -1,5 +1,6 @@
 mountpoint
 realdir
+teardown
 fs
 fs-debug
 libmap.a

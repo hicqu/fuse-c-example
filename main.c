@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fuse.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +13,7 @@
 #include <unistd.h>
 
 static const char *realdir = "./realdir";
+static const char *teardown = "./teardown";
 
 // A map from path to its undo_logs.
 struct CMap;
@@ -21,6 +23,7 @@ extern void destroy_map(struct CMap *map);
 extern void *hash_map_get(struct CMap *map, const char *key);
 extern void *hash_map_insert(struct CMap *map, const char *key, void *value);
 extern void *hash_map_remove(struct CMap *map, const char *key);
+extern char *map_next_key(struct CMap *map);
 
 void *zero_malloc(size_t size) {
     void *ptr = malloc(size);
@@ -44,7 +47,7 @@ static struct CMap *path_to_undo_logs = NULL;
 static pthread_mutex_t undo_logs_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static const size_t LARGE_UNDO_LOG_SISE = (1 << 20) * 32; // 32M
-static const int UNDO_LOG_FLUSH_INTERVAL = 5;             // 30s
+static const int UNDO_LOG_FLUSH_INTERVAL = 1000;          // 30s
 static size_t undo_logs_size = 0;
 
 // Must be called in lock context.
@@ -93,6 +96,44 @@ void free_all_undo_logs() {
     undo_logs_head = NULL;
     undo_logs_tail = NULL;
     clear_map(path_to_undo_logs, NULL);
+}
+
+// Must be called in lock context.
+void replay_all_undo_logs() {
+    char *path = NULL;
+    while ((path = map_next_key(path_to_undo_logs)) != NULL) {
+        // Reverse the list.
+        struct undo_log_entry *head = hash_map_remove(path_to_undo_logs, path);
+        assert(head);
+        struct undo_log_entry *tail = NULL;
+        while (head->next) {
+            struct undo_log_entry *next = head->next;
+            head->next = tail;
+            tail = head;
+            head = next;
+        }
+        // Replay undo logs one by one.
+        while (head) {
+            char *real_path = zero_malloc(1 + strlen(realdir) + strlen(path));
+            sprintf(real_path, "%s%s", realdir, path);
+            int fd = open(real_path, O_WRONLY);
+            if (fd >= 0) {
+                // The file could be deleted.
+                if (head->size > 0) {
+                    assert(fd >= 0);
+                    pwrite(fd, head->ptr, head->size, head->offset);
+                }
+                ftruncate(fd, head->offset + head->size);
+                close(fd);
+            }
+            struct undo_log_entry *next = head->next;
+            free_undo_log(head);
+            head = next;
+        }
+        free(path);
+    }
+    undo_logs_head = NULL;
+    undo_logs_tail = NULL;
 }
 
 // get attributes from tmp file first, try real path if the tmp file doesn't exist.
@@ -265,12 +306,12 @@ static int rename_callback(const char *path1, const char *path2) {
         return error;
     }
 
-    pthread_mutex_lock(&undo_logs_mutex);
+    assert(pthread_mutex_lock(&undo_logs_mutex) == 0);
     void *undo_log = hash_map_remove(path_to_undo_logs, path1);
     if (undo_log) {
         hash_map_insert(path_to_undo_logs, path2, undo_log);
     }
-    pthread_mutex_unlock(&undo_logs_mutex);
+    assert(pthread_mutex_unlock(&undo_logs_mutex) == 0);
     return 0;
 }
 
@@ -400,6 +441,7 @@ static int write_callback(const char *path, const char *buf, size_t size, off_t 
     ssize_t backup_size = pread(read_fd, undo_log->ptr, size, offset);
     assert(backup_size >= 0);
 
+    // When recover from the undo log, will truncate to offset + size.
     if (backup_size == 0) {
         free(undo_log->ptr);
         undo_log->ptr = NULL;
@@ -407,7 +449,7 @@ static int write_callback(const char *path, const char *buf, size_t size, off_t 
         undo_log->size = backup_size;
     }
 
-    pthread_mutex_lock(&undo_logs_mutex);
+    assert(pthread_mutex_lock(&undo_logs_mutex) == 0);
     // Link the undo log to the global buffer.
     if (!undo_logs_tail) {
         undo_logs_tail = undo_log;
@@ -419,9 +461,10 @@ static int write_callback(const char *path, const char *buf, size_t size, off_t 
     }
     // Link the undo log to the file's buffer.
     undo_log->next = hash_map_get(path_to_undo_logs, path);
+    fprintf(stderr, "next is: %lx\n", (long)undo_log->next);
     hash_map_insert(path_to_undo_logs, path, undo_log);
     undo_logs_size += undo_log->size;
-    pthread_mutex_unlock(&undo_logs_mutex);
+    assert(pthread_mutex_unlock(&undo_logs_mutex) == 0);
 
     ssize_t writed = pwrite(fi->fh, buf, size, offset);
     if (writed < 0) {
@@ -444,9 +487,9 @@ static int release_callback(const char *path, struct fuse_file_info *fi) {
 static int fsync_callback(const char *path, int datasync /* only sync user data */,
                           struct fuse_file_info *fi) {
     fprintf(stderr, "fsync %s, only care about data: %d\n", path, datasync);
-    pthread_mutex_lock(&undo_logs_mutex);
+    assert(pthread_mutex_lock(&undo_logs_mutex) == 0);
     free_undo_logs_for_fsync(path);
-    pthread_mutex_unlock(&undo_logs_mutex);
+    assert(pthread_mutex_unlock(&undo_logs_mutex) == 0);
     return 0;
 }
 
@@ -518,12 +561,6 @@ static struct fuse_operations fuse_example_operations = {
     .statfs = statfs_callback,
 };
 
-void *fs_event_loop(void *arg) {
-    struct fuse *fs = (struct fuse *)arg;
-    fuse_loop(fs);
-    return NULL;
-}
-
 void *flush_loop(void *arg) {
     time_t start = time(NULL);
     while (1) {
@@ -540,24 +577,40 @@ void *flush_loop(void *arg) {
     FLUSH:
         fprintf(stderr, "flush all dirty pages, total bytes: %ld\n", dirty_bytes);
         start = now;
-        pthread_mutex_lock(&undo_logs_mutex);
+        assert(pthread_mutex_lock(&undo_logs_mutex) == 0);
         free_all_undo_logs();
-        pthread_mutex_unlock(&undo_logs_mutex);
+        assert(pthread_mutex_unlock(&undo_logs_mutex) == 0);
     }
+    return NULL;
+}
+
+void *signal_loop(void *arg) {
+    int fd = open(teardown, O_CREAT | O_TRUNC | O_RDONLY, 0644);
+    assert(fd >= 0);
+    char buf[1];
+    ssize_t read_bytes;
+    while ((read_bytes = read(fd, &buf, 1)) >= 0) {
+        if (read_bytes == 0) {
+            sleep(1);
+            continue;
+        }
+        fprintf(stderr, "signal fuse threads to exit\n");
+        pthread_kill((pthread_t)arg, SIGINT);
+        return NULL;
+    }
+    fprintf(stderr, "wait for signal fail: %s\n", strerror(errno));
+    return NULL;
 }
 
 int main(int argc, char *argv[]) {
     path_to_undo_logs = init_hash_map();
-
-    char *mountpoint;
-    int multithreaded;
-    struct fuse *fs = fuse_setup(argc, argv, &fuse_example_operations,
-                                 sizeof(struct fuse_operations), &mountpoint, &multithreaded, NULL);
-    pthread_t fs_thread, flush_thread;
-    pthread_create(&fs_thread, NULL, fs_event_loop, fs);
+    pthread_t flush_thread, signal_thread;
     pthread_create(&flush_thread, NULL, flush_loop, NULL);
-
-    sleep(30000000);
-    fuse_teardown(fs, mountpoint);
-    return 0;
+    pthread_create(&signal_thread, NULL, signal_loop, (void *)pthread_self());
+    int ret = fuse_main(argc, argv, &fuse_example_operations, NULL);
+    fprintf(stderr, "fuse_main exits %d, clear all unsynced writes\n", ret);
+    assert(pthread_mutex_lock(&undo_logs_mutex) == 0);
+    replay_all_undo_logs();
+    assert(pthread_mutex_unlock(&undo_logs_mutex) == 0);
+    return ret;
 }
