@@ -47,7 +47,7 @@ static struct CMap *path_to_undo_logs = NULL;
 static pthread_mutex_t undo_logs_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static const size_t LARGE_UNDO_LOG_SISE = (1 << 20) * 32; // 32M
-static const int UNDO_LOG_FLUSH_INTERVAL = 1000;          // 30s
+static const int UNDO_LOG_FLUSH_INTERVAL = 30;            // 30s
 static size_t undo_logs_size = 0;
 
 // Must be called in lock context.
@@ -102,16 +102,7 @@ void free_all_undo_logs() {
 void replay_all_undo_logs() {
     char *path = NULL;
     while ((path = map_next_key(path_to_undo_logs)) != NULL) {
-        // Reverse the list.
         struct undo_log_entry *head = hash_map_remove(path_to_undo_logs, path);
-        assert(head);
-        struct undo_log_entry *tail = NULL;
-        while (head->next) {
-            struct undo_log_entry *next = head->next;
-            head->next = tail;
-            tail = head;
-            head = next;
-        }
         // Replay undo logs one by one.
         while (head) {
             char *real_path = zero_malloc(1 + strlen(realdir) + strlen(path));
@@ -123,8 +114,11 @@ void replay_all_undo_logs() {
                     assert(fd >= 0);
                     pwrite(fd, head->ptr, head->size, head->offset);
                 }
-                ftruncate(fd, head->offset + head->size);
+                off_t trunc_to = head->offset + head->size;
+                ftruncate(fd, trunc_to);
                 close(fd);
+                fprintf(stderr, "replay undo logs for %s, at %ld, truncate to %ld\n", path,
+                        head->offset, trunc_to);
             }
             struct undo_log_entry *next = head->next;
             free_undo_log(head);
@@ -566,16 +560,16 @@ void *flush_loop(void *arg) {
     while (1) {
         sleep(1);
         time_t now = time(NULL);
-        size_t dirty_bytes = __sync_fetch_and_add(&undo_logs_size, 0);
+        size_t undo_log_bytes = __sync_fetch_and_add(&undo_logs_size, 0);
         if (now - start >= UNDO_LOG_FLUSH_INTERVAL) {
             goto FLUSH;
         }
-        if (dirty_bytes >= LARGE_UNDO_LOG_SISE) {
+        if (undo_log_bytes >= LARGE_UNDO_LOG_SISE) {
             goto FLUSH;
         }
         continue;
     FLUSH:
-        fprintf(stderr, "flush all dirty pages, total bytes: %ld\n", dirty_bytes);
+        fprintf(stderr, "drop all undo logs, total bytes: %ld\n", undo_log_bytes);
         start = now;
         assert(pthread_mutex_lock(&undo_logs_mutex) == 0);
         free_all_undo_logs();
