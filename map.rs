@@ -40,15 +40,14 @@ pub extern "C" fn hash_map_remove(map: *mut Map, key: *const c_char) -> *mut u8 
     ret
 }
 
-// TODO: pass in a callback to deconstruct values.
 #[no_mangle]
-pub extern "C" fn clear_map(map: *mut Map, free_value: fn(*mut u8)) {
+pub extern "C" fn clear_map(map: *mut Map, free_value: *const unsafe fn(*mut u8)) {
     let mut map = unsafe { Box::from_raw(map) };
     let taked_map = mem::replace(map.as_mut(), HashMap::new());
     Box::into_raw(map);
-    for (_, value) in taked_map {
-        if !(free_value as *const ()).is_null() {
-            free_value(value);
+    if !(free_value as *const ()).is_null() {
+        for (_, value) in taked_map {
+            unsafe { (*free_value)(value) };
         }
     }
 }
