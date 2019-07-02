@@ -579,7 +579,8 @@ void *flush_loop(void *arg) {
 }
 
 void *signal_loop(void *arg) {
-    int fd = open(teardown, O_CREAT | O_TRUNC | O_RDONLY, 0644);
+    umask(0000);
+    int fd = open(teardown, O_CREAT | O_TRUNC | O_RDONLY, 0666);
     assert(fd >= 0);
     char buf[1];
     ssize_t read_bytes;
