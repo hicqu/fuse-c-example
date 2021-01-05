@@ -77,5 +77,4 @@ pub extern "C" fn destroy_map(map: *mut Map) {
 }
 
 #[repr(C)]
-#[no_mangle]
 pub struct CMap;
